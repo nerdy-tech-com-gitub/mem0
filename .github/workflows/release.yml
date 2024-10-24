@@ -1,338 +1,222 @@
-name: Runner CD
-
-on:
-  workflow_dispatch:
-  push:
-    paths:
-    - releaseVersion
-
+concurrency:
+  group: "create-release-${{ github.sha }}"
+env:
+  BUILD_ARTIFACTS_BUCKET: "loki-build-artifacts"
+  IMAGE_PREFIX: "grafana"
+  PUBLISH_TO_GCS: false
+  RELEASE_LIB_REF: "main"
+  RELEASE_REPO: "grafana/loki"
+  USE_GITHUB_APP_TOKEN: true
 jobs:
-  check:
-    if: startsWith(github.ref, 'refs/heads/releases/') || github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v3
-
-    # Make sure ./releaseVersion match ./src/runnerversion
-    # Query GitHub release ensure version is not used
-    - name: Check version
-      uses: actions/github-script@0.3.0
-      with:
-        github-token: ${{secrets.GITHUB_TOKEN}}
-        script: |
-          const core = require('@actions/core')
-          const fs = require('fs');
-          const runnerVersion = fs.readFileSync('${{ github.workspace }}/src/runnerversion', 'utf8').replace(/\n$/g, '')
-          const releaseVersion = fs.readFileSync('${{ github.workspace }}/releaseVersion', 'utf8').replace(/\n$/g, '')
-          if (runnerVersion != releaseVersion) {
-            console.log('Request Release Version: ' + releaseVersion + '\nCurrent Runner Version: ' + runnerVersion)
-            core.setFailed('Version mismatch! Make sure ./releaseVersion match ./src/runnerVersion')
-            return
-          }
-          try {
-            const release = await github.repos.getReleaseByTag({
-              owner: '${{ github.event.repository.owner.name }}',
-              repo: '${{ github.event.repository.name }}',
-              tag: 'v' + runnerVersion
-            })
-            core.setFailed('Release with same tag already created: ' + release.data.html_url)
-          } catch (e) {
-            // We are good to create the release if release with same tag doesn't exists
-            if (e.status != 404) {
-              throw e
-            }
-          }
-
-  build:
-    needs: check
+  createRelease:
+    if: "${{ fromJSON(needs.shouldRelease.outputs.shouldRelease) }}"
+    needs:
+    - "shouldRelease"
     outputs:
-      linux-x64-sha: ${{ steps.sha.outputs.linux-x64-sha256 }}
-      linux-arm64-sha: ${{ steps.sha.outputs.linux-arm64-sha256 }}
-      linux-arm-sha: ${{ steps.sha.outputs.linux-arm-sha256 }}
-      win-x64-sha: ${{ steps.sha.outputs.win-x64-sha256 }}
-      win-arm64-sha: ${{ steps.sha.outputs.win-arm64-sha256 }}
-      osx-x64-sha: ${{ steps.sha.outputs.osx-x64-sha256 }}
-      osx-arm64-sha: ${{ steps.sha.outputs.osx-arm64-sha256 }}
-    strategy:
-      matrix:
-        runtime: [ linux-x64, linux-arm64, linux-arm, win-x64, osx-x64, osx-arm64, win-arm64 ]
-        include:
-        - runtime: linux-x64
-          os: ubuntu-latest
-          devScript: ./dev.sh
-
-        - runtime: linux-arm64
-          os: ubuntu-latest
-          devScript: ./dev.sh
-
-        - runtime: linux-arm
-          os: ubuntu-latest
-          devScript: ./dev.sh
-
-        - runtime: osx-x64
-          os: macOS-latest
-          devScript: ./dev.sh
-
-        - runtime: osx-arm64
-          os: macOS-latest
-          devScript: ./dev.sh
-
-        - runtime: win-x64
-          os: windows-2019
-          devScript: ./dev
-
-        - runtime: win-arm64
-          os: windows-latest
-          devScript: ./dev
-
-    runs-on: ${{ matrix.os }}
+      draft: "${{ steps.check_release.outputs.draft }}"
+      exists: "${{ steps.check_release.outputs.exists }}"
+      isLatest: "${{ needs.shouldRelease.outputs.isLatest }}"
+      name: "${{ needs.shouldRelease.outputs.name }}"
+      sha: "${{ needs.shouldRelease.outputs.sha }}"
+    runs-on: "ubuntu-latest"
     steps:
-    - uses: actions/checkout@v3
-
-    # Build runner layout
-    - name: Build & Layout Release
-      run: |
-        ${{ matrix.devScript }} layout Release ${{ matrix.runtime }}
-      working-directory: src
-
-    # Create runner package tar.gz/zip
-    - name: Package Release
-      if: github.event_name != 'pull_request'
-      run: |
-        ${{ matrix.devScript }} package Release ${{ matrix.runtime }}
-      working-directory: src
-
-    # compute shas and set as job outputs to use in release notes
-    - run: brew install coreutils #needed for shasum util
-      if: ${{ matrix.os == 'macOS-latest' }}
-      name: Install Dependencies for SHA Calculation (osx)
-    - run: |
-        file=$(ls)
-        sha=$(sha256sum $file | awk '{ print $1 }')
-        echo "Computed sha256: $sha for $file"
-        echo "${{matrix.runtime}}-sha256=$sha" >> $GITHUB_OUTPUT
-      shell: bash
-      id: sha
-      name: Compute SHA256
-      working-directory: _package
-
-    # Upload runner package tar.gz/zip as artifact.
-    - name: Publish Artifact
-      if: github.event_name != 'pull_request'
-      uses: actions/upload-artifact@v4
+    - name: "pull code to release"
+      uses: "actions/checkout@v4"
       with:
-        name: runner-packages-${{ matrix.runtime }}
-        path: |
-          _package
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
+        path: "release"
+        repository: "${{ env.RELEASE_REPO }}"
+    - name: "pull release library code"
+      uses: "actions/checkout@v4"
+      with:
+        path: "lib"
+        ref: "${{ env.RELEASE_LIB_REF }}"
+        repository: "grafana/loki-release"
+    - name: "setup node"
+      uses: "actions/setup-node@v4"
+      with:
+        node-version: 20
+    - name: "auth gcs"
+      uses: "google-github-actions/auth@v2"
+      with:
+        credentials_json: "${{ secrets.GCS_SERVICE_ACCOUNT_KEY }}"
+    - name: "Set up Cloud SDK"
+      uses: "google-github-actions/setup-gcloud@v2"
+      with:
+        version: ">= 452.0.0"
+    - id: "get_github_app_token"
+      if: "${{ fromJSON(env.USE_GITHUB_APP_TOKEN) }}"
+      name: "get github app token"
+      uses: "actions/create-github-app-token@v1"
+      with:
+        app-id: "${{ secrets.APP_ID }}"
+        owner: "${{ github.repository_owner }}"
+        private-key: "${{ secrets.APP_PRIVATE_KEY }}"
+    - id: "github_app_token"
+      name: "set github token"
+      run: |
+        if [[ "${USE_GITHUB_APP_TOKEN}" == "true" ]]; then
+          echo "token=${{ steps.get_github_app_token.outputs.token }}" >> $GITHUB_OUTPUT
+        else
+          echo "token=${{ secrets.GH_TOKEN }}" >> $GITHUB_OUTPUT
+        fi
+    - name: "download binaries"
+      run: |
+        echo "downloading binaries to $(pwd)/dist"
+        gsutil cp -r gs://${BUILD_ARTIFACTS_BUCKET}/${{ needs.shouldRelease.outputs.sha }}/dist .
+      working-directory: "release"
+    - env:
+        GH_TOKEN: "${{ steps.github_app_token.outputs.token }}"
+      id: "check_release"
+      name: "check if release exists"
+      run: |
+        set +e
+        isDraft="$(gh release view --json="isDraft" --jq=".isDraft" ${{ needs.shouldRelease.outputs.name }} 2>&1)"
+        set -e
+        if [[ "$isDraft" == "release not found" ]]; then
+          echo "exists=false" >> $GITHUB_OUTPUT
+        else
+          echo "exists=true" >> $GITHUB_OUTPUT
+        fi
+        
+        if [[ "$isDraft" == "true" ]]; then
+          echo "draft=true" >> $GITHUB_OUTPUT
+        fi
+      working-directory: "release"
+    - id: "release"
+      if: "${{ !fromJSON(steps.check_release.outputs.exists) }}"
+      name: "create release"
+      run: |
+        npm install
+        npm exec -- release-please github-release \
+          --draft \
+          --release-type simple \
+          --repo-url "${{ env.RELEASE_REPO }}" \
+          --target-branch "${{ needs.shouldRelease.outputs.branch }}" \
+          --token "${{ steps.github_app_token.outputs.token }}" \
+          --shas-to-tag "${{ needs.shouldRelease.outputs.prNumber }}:${{ needs.shouldRelease.outputs.sha }}"
+      working-directory: "lib"
+    - env:
+        GH_TOKEN: "${{ steps.github_app_token.outputs.token }}"
+      id: "upload"
+      name: "upload artifacts"
+      run: |
+        gh release upload --clobber ${{ needs.shouldRelease.outputs.name }} dist/*
+      working-directory: "release"
+    - if: "${{ fromJSON(env.PUBLISH_TO_GCS) }}"
+      name: "release artifacts"
+      uses: "google-github-actions/upload-cloud-storage@v2"
+      with:
+        destination: "${{ env.PUBLISH_BUCKET }}"
+        parent: false
+        path: "release/dist"
+        process_gcloudignore: false
+  publishImages:
+    needs:
+    - "createRelease"
+    runs-on: "ubuntu-latest"
     steps:
-
-    - uses: actions/checkout@v3
-
-    # Download runner package tar.gz/zip produced by 'build' job
-    - name: Download Artifact (win-x64)
-      uses: actions/download-artifact@v4
+    - name: "pull release library code"
+      uses: "actions/checkout@v4"
       with:
-        name: runner-packages-win-x64
-        path: ./
-    - name: Download Artifact (win-arm64)
-      uses: actions/download-artifact@v4
+        path: "lib"
+        ref: "${{ env.RELEASE_LIB_REF }}"
+        repository: "grafana/loki-release"
+    - name: "auth gcs"
+      uses: "google-github-actions/auth@v2"
       with:
-        name: runner-packages-win-arm64
-        path: ./
-    - name: Download Artifact (osx-x64)
-      uses: actions/download-artifact@v4
+        credentials_json: "${{ secrets.GCS_SERVICE_ACCOUNT_KEY }}"
+    - name: "Set up Cloud SDK"
+      uses: "google-github-actions/setup-gcloud@v2"
       with:
-        name: runner-packages-osx-x64
-        path: ./
-    - name: Download Artifact (osx-arm64)
-      uses: actions/download-artifact@v4
-      with:
-        name: runner-packages-osx-arm64
-        path: ./
-    - name: Download Artifact (linux-x64)
-      uses: actions/download-artifact@v4
-      with:
-        name: runner-packages-linux-x64
-        path: ./
-    - name: Download Artifact (linux-arm)
-      uses: actions/download-artifact@v4
-      with:
-        name: runner-packages-linux-arm
-        path: ./
-    - name: Download Artifact (linux-arm64)
-      uses: actions/download-artifact@v4
-      with:
-        name: runner-packages-linux-arm64
-        path: ./
-
-    # Create ReleaseNote file
-    - name: Create ReleaseNote
-      id: releaseNote
-      uses: actions/github-script@0.3.0
-      with:
-        github-token: ${{secrets.GITHUB_TOKEN}}
-        script: |
-          const core = require('@actions/core')
-          const fs = require('fs');
-          const runnerVersion = fs.readFileSync('${{ github.workspace }}/src/runnerversion', 'utf8').replace(/\n$/g, '')
-          var releaseNote = fs.readFileSync('${{ github.workspace }}/releaseNote.md', 'utf8').replace(/<RUNNER_VERSION>/g, runnerVersion)
-          releaseNote = releaseNote.replace(/<WIN_X64_SHA>/g, '${{needs.build.outputs.win-x64-sha}}')
-          releaseNote = releaseNote.replace(/<WIN_ARM64_SHA>/g, '${{needs.build.outputs.win-arm64-sha}}')
-          releaseNote = releaseNote.replace(/<OSX_X64_SHA>/g, '${{needs.build.outputs.osx-x64-sha}}')
-          releaseNote = releaseNote.replace(/<OSX_ARM64_SHA>/g, '${{needs.build.outputs.osx-arm64-sha}}')
-          releaseNote = releaseNote.replace(/<LINUX_X64_SHA>/g, '${{needs.build.outputs.linux-x64-sha}}')
-          releaseNote = releaseNote.replace(/<LINUX_ARM_SHA>/g, '${{needs.build.outputs.linux-arm-sha}}')
-          releaseNote = releaseNote.replace(/<LINUX_ARM64_SHA>/g, '${{needs.build.outputs.linux-arm64-sha}}')
-          console.log(releaseNote)
-          core.setOutput('version', runnerVersion);
-          core.setOutput('note', releaseNote);
-
-    - name: Validate Packages HASH
+        version: ">= 452.0.0"
+    - name: "Set up QEMU"
+      uses: "docker/setup-qemu-action@v3"
+    - name: "set up docker buildx"
+      uses: "docker/setup-buildx-action@v3"
+    - name: "Login to DockerHub (from vault)"
+      uses: "grafana/shared-workflows/actions/dockerhub-login@main"
+    - name: "download images"
       run: |
-        ls -l
-        echo "${{needs.build.outputs.win-x64-sha}}  actions-runner-win-x64-${{ steps.releaseNote.outputs.version }}.zip" | shasum -a 256 -c
-        echo "${{needs.build.outputs.win-arm64-sha}}  actions-runner-win-arm64-${{ steps.releaseNote.outputs.version }}.zip" | shasum -a 256 -c
-        echo "${{needs.build.outputs.osx-x64-sha}}  actions-runner-osx-x64-${{ steps.releaseNote.outputs.version }}.tar.gz" | shasum -a 256 -c
-        echo "${{needs.build.outputs.osx-arm64-sha}}  actions-runner-osx-arm64-${{ steps.releaseNote.outputs.version }}.tar.gz" | shasum -a 256 -c
-        echo "${{needs.build.outputs.linux-x64-sha}}  actions-runner-linux-x64-${{ steps.releaseNote.outputs.version }}.tar.gz" | shasum -a 256 -c
-        echo "${{needs.build.outputs.linux-arm-sha}}  actions-runner-linux-arm-${{ steps.releaseNote.outputs.version }}.tar.gz" | shasum -a 256 -c
-        echo "${{needs.build.outputs.linux-arm64-sha}}  actions-runner-linux-arm64-${{ steps.releaseNote.outputs.version }}.tar.gz" | shasum -a 256 -c
-
-    # Create GitHub release
-    - uses: actions/create-release@master
-      id: createRelease
-      name: Create ${{ steps.releaseNote.outputs.version }} Runner Release
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        echo "downloading images to $(pwd)/images"
+        gsutil cp -r gs://${BUILD_ARTIFACTS_BUCKET}/${{ needs.createRelease.outputs.sha }}/images .
+    - name: "publish docker images"
+      uses: "./lib/actions/push-images"
       with:
-        tag_name: "v${{ steps.releaseNote.outputs.version }}"
-        release_name: "v${{ steps.releaseNote.outputs.version }}"
-        body: |
-          ${{ steps.releaseNote.outputs.note }}
-
-    # Upload release assets (full runner packages)
-    - name: Upload Release Asset (win-x64)
-      uses: actions/upload-release-asset@v1.0.1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.createRelease.outputs.upload_url }}
-        asset_path: ${{ github.workspace }}/actions-runner-win-x64-${{ steps.releaseNote.outputs.version }}.zip
-        asset_name: actions-runner-win-x64-${{ steps.releaseNote.outputs.version }}.zip
-        asset_content_type: application/octet-stream
-
-    - name: Upload Release Asset (win-arm64)
-      uses: actions/upload-release-asset@v1.0.1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.createRelease.outputs.upload_url }}
-        asset_path: ${{ github.workspace }}/actions-runner-win-arm64-${{ steps.releaseNote.outputs.version }}.zip
-        asset_name: actions-runner-win-arm64-${{ steps.releaseNote.outputs.version }}.zip
-        asset_content_type: application/octet-stream
-
-    - name: Upload Release Asset (linux-x64)
-      uses: actions/upload-release-asset@v1.0.1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.createRelease.outputs.upload_url }}
-        asset_path: ${{ github.workspace }}/actions-runner-linux-x64-${{ steps.releaseNote.outputs.version }}.tar.gz
-        asset_name: actions-runner-linux-x64-${{ steps.releaseNote.outputs.version }}.tar.gz
-        asset_content_type: application/octet-stream
-
-    - name: Upload Release Asset (osx-x64)
-      uses: actions/upload-release-asset@v1.0.1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.createRelease.outputs.upload_url }}
-        asset_path: ${{ github.workspace }}/actions-runner-osx-x64-${{ steps.releaseNote.outputs.version }}.tar.gz
-        asset_name: actions-runner-osx-x64-${{ steps.releaseNote.outputs.version }}.tar.gz
-        asset_content_type: application/octet-stream
-
-    - name: Upload Release Asset (osx-arm64)
-      uses: actions/upload-release-asset@v1.0.1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.createRelease.outputs.upload_url }}
-        asset_path: ${{ github.workspace }}/actions-runner-osx-arm64-${{ steps.releaseNote.outputs.version }}.tar.gz
-        asset_name: actions-runner-osx-arm64-${{ steps.releaseNote.outputs.version }}.tar.gz
-        asset_content_type: application/octet-stream
-
-    - name: Upload Release Asset (linux-arm)
-      uses: actions/upload-release-asset@v1.0.1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.createRelease.outputs.upload_url }}
-        asset_path: ${{ github.workspace }}/actions-runner-linux-arm-${{ steps.releaseNote.outputs.version }}.tar.gz
-        asset_name: actions-runner-linux-arm-${{ steps.releaseNote.outputs.version }}.tar.gz
-        asset_content_type: application/octet-stream
-
-    - name: Upload Release Asset (linux-arm64)
-      uses: actions/upload-release-asset@v1.0.1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.createRelease.outputs.upload_url }}
-        asset_path: ${{ github.workspace }}/actions-runner-linux-arm64-${{ steps.releaseNote.outputs.version }}.tar.gz
-        asset_name: actions-runner-linux-arm64-${{ steps.releaseNote.outputs.version }}.tar.gz
-        asset_content_type: application/octet-stream
-
-  publish-image:
-    needs: release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    env:
-      REGISTRY: ghcr.io
-      IMAGE_NAME: ${{ github.repository_owner }}/actions-runner
+        imageDir: "images"
+        imagePrefix: "${{ env.IMAGE_PREFIX }}"
+  publishRelease:
+    needs:
+    - "createRelease"
+    - "publishImages"
+    runs-on: "ubuntu-latest"
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-
-      - name: Compute image version
-        id: image
-        uses: actions/github-script@v6
-        with:
-          script: |
-            const fs = require('fs');
-            const runnerVersion = fs.readFileSync('${{ github.workspace }}/releaseVersion', 'utf8').replace(/\n$/g, '')
-            console.log(`Using runner version ${runnerVersion}`)
-            core.setOutput('version', runnerVersion);
-
-      - name: Setup Docker buildx
-        uses: docker/setup-buildx-action@v2
-
-      - name: Log into registry ${{ env.REGISTRY }}
-        uses: docker/login-action@v2
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push Docker image
-        id: build-and-push
-        uses: docker/build-push-action@v3
-        with:
-          context: ./images
-          platforms: |
-            linux/amd64
-            linux/arm64
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.image.outputs.version }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          build-args: |
-            RUNNER_VERSION=${{ steps.image.outputs.version }}
-          push: true
-          labels: |
-            org.opencontainers.image.source=${{github.server_url}}/${{github.repository}}
-            org.opencontainers.image.description=https://github.com/actions/runner/releases/tag/v${{ steps.image.outputs.version }}
-            org.opencontainers.image.licenses=MIT
+    - name: "pull code to release"
+      uses: "actions/checkout@v4"
+      with:
+        path: "release"
+        repository: "${{ env.RELEASE_REPO }}"
+    - id: "get_github_app_token"
+      if: "${{ fromJSON(env.USE_GITHUB_APP_TOKEN) }}"
+      name: "get github app token"
+      uses: "actions/create-github-app-token@v1"
+      with:
+        app-id: "${{ secrets.APP_ID }}"
+        owner: "${{ github.repository_owner }}"
+        private-key: "${{ secrets.APP_PRIVATE_KEY }}"
+    - id: "github_app_token"
+      name: "set github token"
+      run: |
+        if [[ "${USE_GITHUB_APP_TOKEN}" == "true" ]]; then
+          echo "token=${{ steps.get_github_app_token.outputs.token }}" >> $GITHUB_OUTPUT
+        else
+          echo "token=${{ secrets.GH_TOKEN }}" >> $GITHUB_OUTPUT
+        fi
+    - env:
+        GH_TOKEN: "${{ steps.github_app_token.outputs.token }}"
+      if: "${{ !fromJSON(needs.createRelease.outputs.exists) || (needs.createRelease.outputs.draft && fromJSON(needs.createRelease.outputs.draft)) }}"
+      name: "publish release"
+      run: |
+        gh release edit ${{ needs.createRelease.outputs.name }} --draft=false --latest=${{ needs.createRelease.outputs.isLatest }}
+      working-directory: "release"
+  shouldRelease:
+    outputs:
+      branch: "${{ steps.extract_branch.outputs.branch }}"
+      isLatest: "${{ steps.should_release.outputs.isLatest }}"
+      name: "${{ steps.should_release.outputs.name }}"
+      prNumber: "${{ steps.should_release.outputs.prNumber }}"
+      sha: "${{ steps.should_release.outputs.sha }}"
+      shouldRelease: "${{ steps.should_release.outputs.shouldRelease }}"
+    runs-on: "ubuntu-latest"
+    steps:
+    - name: "pull code to release"
+      uses: "actions/checkout@v4"
+      with:
+        path: "release"
+        repository: "${{ env.RELEASE_REPO }}"
+    - name: "pull release library code"
+      uses: "actions/checkout@v4"
+      with:
+        path: "lib"
+        ref: "${{ env.RELEASE_LIB_REF }}"
+        repository: "grafana/loki-release"
+    - id: "extract_branch"
+      name: "extract branch name"
+      run: |
+        echo "branch=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_OUTPUT
+      working-directory: "release"
+    - id: "should_release"
+      name: "should a release be created?"
+      uses: "./lib/actions/should-release"
+      with:
+        baseBranch: "${{ steps.extract_branch.outputs.branch }}"
+name: "create release"
+"on":
+  push:
+    branches:
+    - "release-[0-9]+.[0-9]+.x"
+    - "k[0-9]+"
+    - "main"
+permissions:
+  contents: "write"
+  id-token: "write"
+  pull-requests: "write"
