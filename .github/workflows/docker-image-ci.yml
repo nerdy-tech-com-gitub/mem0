@@ -1,0 +1,39 @@
+name: Docker Image CI
+
+on:
+  pull_request:
+    branches: ['main']
+    paths:
+      - 'Dockerfile'
+      - 'scripts/*'
+      - '.github/workflows/docker-image-ci.yml'
+      - 'samples/'
+
+# Abort the previous running CI workflow in the same pull request
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Build the Docker image
+        run: |
+          SHA7=${GITHUB_SHA::7}
+          echo $SHA7
+          docker build . --file Dockerfile --tag "devops-toolkit-review:$GITHUB_SHA"
+
+      - name: Verify tool versions
+        run: |
+          cd scripts
+          chmod +x check_version_in_toolkit.sh
+          ./check_version_in_toolkit.sh "devops-toolkit-review:$GITHUB_SHA" "../toolkit_info.json"
+
+      - name: Running Sample Tool Code
+        run: |
+          echo "Run sample tool code inside toolkit"
+          docker run --rm devops-toolkit-review:$GITHUB_SHA samples/run_sample.sh
