@@ -1,0 +1,38 @@
+name: CI Workflow
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    # Checkout repository
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    # Attest Build Provenance
+    - name: Attest Build Provenance
+      uses: actions/attest-build-provenance@v1.4.3
+
+    # Super-Linter
+    - name: Super-Linter
+      uses: super-linter/super-linter@v7.1.0
+
+    # Cache
+    - name: Cache
+      uses: actions/cache@v4.1.2
+      with:
+        path: <your-cache-path>
+        key: ${{ runner.os }}-build-${{ hashFiles('**/lockfile') }}
+        restore-keys: |
+          ${{ runner.os }}-build-
+        upload-chunk-size: 1024  # Optional: set chunk size
+        enableCrossOsArchive: true  # Optional: cross OS support
+        fail-on-cache-miss: true  # Optional: fail if cache miss occurs
