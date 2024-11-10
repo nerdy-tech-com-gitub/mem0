@@ -1,5 +1,7 @@
 import logging
 
+from mem0.memory.utils import format_entities
+
 try:
     from langchain_community.graphs import Neo4jGraph
 except ImportError:
@@ -94,8 +96,8 @@ class MemoryGraph:
             extracted_entities = []
 
         logger.debug(f"Extracted entities: {extracted_entities}")
-
-        update_memory_prompt = get_update_memory_messages(search_output, extracted_entities)
+        search_output_string = format_entities(search_output)
+        update_memory_prompt = get_update_memory_messages(search_output_string, extracted_entities)
 
         _tools = [UPDATE_MEMORY_TOOL_GRAPH, ADD_MEMORY_TOOL_GRAPH, NOOP_TOOL]
         if self.llm_provider in ["azure_openai_structured", "openai_structured"]:
@@ -175,7 +177,7 @@ class MemoryGraph:
             messages=[
                 {
                     "role": "system",
-                    "content": f"You are a smart assistant who understands the entities, their types, and relations in a given text. If user message contains self reference such as 'I', 'me', 'my' etc. then use {filters['user_id']} as the source node. Extract the entities.",
+                    "content": f"You are a smart assistant who understands the entities, their types, and relations in a given text. If user message contains self reference such as 'I', 'me', 'my' etc. then use {filters['user_id']} as the source node. Extract the entities. ***DO NOT*** answer the question itself if the given text is a question.",
                 },
                 {"role": "user", "content": query},
             ],
