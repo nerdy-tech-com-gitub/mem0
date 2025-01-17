@@ -1,4 +1,4 @@
-FROM python:3.11-slim AS backend
+FROM python:3.14.0a1-slim AS backend
 
 WORKDIR /usr/src/app/backend
 COPY requirements.txt .
