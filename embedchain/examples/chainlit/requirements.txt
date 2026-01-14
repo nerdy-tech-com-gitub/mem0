@@ -1,2 +1,2 @@
-chainlit==0.7.700
+chainlit==2.8.5
 embedchain==0.1.31
